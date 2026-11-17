@@ -1,11 +1,15 @@
 import { phoneForWhatsApp } from "@/lib/customer";
 
+function envValue(value: string | undefined) {
+  return (value ?? "").trim().replace(/^"(.*)"$/, "$1").trim();
+}
+
 function greenApiConfig() {
-  const idInstance = process.env.GREENAPI_ID_INSTANCE;
-  const apiToken = process.env.GREENAPI_API_TOKEN;
+  const idInstance = envValue(process.env.GREENAPI_ID_INSTANCE);
+  const apiToken = envValue(process.env.GREENAPI_API_TOKEN);
   if (!idInstance || !apiToken) return null;
   const apiUrl = (
-    process.env.GREENAPI_API_URL || "https://7107.api.greenapi.com"
+    envValue(process.env.GREENAPI_API_URL) || "https://7107.api.greenapi.com"
   ).replace(/\/+$/, "");
   return { idInstance, apiToken, apiUrl };
 }
@@ -27,6 +31,7 @@ export type WhatsAppStatus = {
 };
 
 async function greenApiFetch(
+  label: string,
   url: string,
   retries = 1,
 ): Promise<Response | null> {
@@ -37,10 +42,18 @@ async function greenApiFetch(
     });
     if (response.status === 429 && retries > 0) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      return greenApiFetch(url, retries - 1);
+      return greenApiFetch(label, url, retries - 1);
     }
-    return response.ok ? response : null;
-  } catch {
+    if (!response.ok) {
+      console.error(`Green API ${label} responded with HTTP ${response.status}`);
+      return null;
+    }
+    return response;
+  } catch (error) {
+    console.error(
+      `Green API ${label} request failed:`,
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    );
     return null;
   }
 }
@@ -57,6 +70,7 @@ export async function getWhatsAppStatus(): Promise<WhatsAppStatus> {
 
   const base = `${green.apiUrl}/waInstance${green.idInstance}`;
   const stateResponse = await greenApiFetch(
+    "getStateInstance",
     `${base}/getStateInstance/${green.apiToken}`,
   );
   if (!stateResponse) {
@@ -71,6 +85,7 @@ export async function getWhatsAppStatus(): Promise<WhatsAppStatus> {
   let phone: string | null = null;
   if (state === "authorized") {
     const settingsResponse = await greenApiFetch(
+      "getSettings",
       `${base}/getSettings/${green.apiToken}`,
     );
     const settingsJson = (await settingsResponse?.json().catch(() => null)) as {
@@ -88,6 +103,7 @@ export async function getWhatsAppQrImage() {
   if (!green) return null;
 
   const response = await greenApiFetch(
+    "qr",
     `${green.apiUrl}/waInstance${green.idInstance}/qr/${green.apiToken}`,
   );
   if (!response) return null;

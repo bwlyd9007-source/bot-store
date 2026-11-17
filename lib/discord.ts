@@ -31,7 +31,10 @@ function clean(text: string, max = 1024) {
 }
 
 function webhookUrl() {
-  const raw = (process.env.DISCORD_WEBHOOK_URL ?? "").trim();
+  const raw = (process.env.DISCORD_WEBHOOK_URL ?? "")
+    .trim()
+    .replace(/^"(.*)"$/, "$1")
+    .trim();
   return WEBHOOK_PATTERN.test(raw) ? raw : null;
 }
 
