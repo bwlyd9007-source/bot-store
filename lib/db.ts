@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { Pool, type PoolClient } from "pg";
 import type { Customer, Db, OrderEvent, StoreOrder } from "@/lib/types";
 import { normalizeSaudiPhone } from "@/lib/customer";
 import { legacyOrderNumber, normalizeOrderNumber } from "@/lib/orders";
@@ -9,6 +10,7 @@ import { site } from "@/lib/site";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
+const DATABASE_URL = (process.env.DATABASE_URL ?? "").trim();
 
 const SCRYPT_OPTIONS = { N: 16384, r: 8, p: 1 } as const;
 
@@ -167,7 +169,87 @@ function normalize(raw: Partial<Db>): Db {
   };
 }
 
-export async function readDb(): Promise<Db> {
+const usePostgres = DATABASE_URL.startsWith("postgres");
+
+const globalForDb = globalThis as unknown as {
+  __botStorePool?: Pool;
+  __botStoreSchema?: Promise<void>;
+};
+
+function pool() {
+  if (!globalForDb.__botStorePool) {
+    globalForDb.__botStorePool = new Pool({
+      connectionString: DATABASE_URL,
+      max: 3,
+      connectionTimeoutMillis: 10_000,
+      idleTimeoutMillis: 10_000,
+    });
+  }
+  return globalForDb.__botStorePool;
+}
+
+function ensureSchema(client: PoolClient) {
+  globalForDb.__botStoreSchema ??= client
+    .query(
+      `CREATE TABLE IF NOT EXISTS bot_store_state (
+         id integer PRIMARY KEY,
+         data jsonb NOT NULL,
+         updated_at timestamptz NOT NULL DEFAULT now()
+       )`,
+    )
+    .then(() => undefined);
+
+  return globalForDb.__botStoreSchema;
+}
+
+async function readPostgres(): Promise<Db> {
+  const client = await pool().connect();
+  try {
+    await ensureSchema(client);
+    const res = await client.query<{ data: Partial<Db> }>(
+      "SELECT data FROM bot_store_state WHERE id = 1",
+    );
+    if (res.rowCount && res.rows[0]) return normalize(res.rows[0].data);
+
+    const db = defaultDb();
+    await client.query(
+      "INSERT INTO bot_store_state (id, data) VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
+      [db],
+    );
+    return db;
+  } finally {
+    client.release();
+  }
+}
+
+async function updatePostgres<T>(mutator: (db: Db) => T | Promise<T>): Promise<T> {
+  const client = await pool().connect();
+  try {
+    await ensureSchema(client);
+    await client.query("BEGIN");
+    await client.query(
+      "INSERT INTO bot_store_state (id, data) VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
+      [defaultDb()],
+    );
+    const res = await client.query<{ data: Partial<Db> }>(
+      "SELECT data FROM bot_store_state WHERE id = 1 FOR UPDATE",
+    );
+    const db = normalize(res.rows[0]?.data ?? {});
+    const result = await mutator(db);
+    await client.query("UPDATE bot_store_state SET data = $1, updated_at = now() WHERE id = 1", [
+      db,
+    ]);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function readFileDb(): Promise<Db> {
   try {
     const raw = await readFile(DB_FILE, "utf8");
     return normalize(JSON.parse(raw) as Partial<Db>);
@@ -175,15 +257,28 @@ export async function readDb(): Promise<Db> {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 
     const db = defaultDb();
-    await writeDb(db);
+    await writeFileDb(db);
     return db;
   }
 }
 
-export async function writeDb(db: Db) {
+async function writeFileDb(db: Db) {
   await mkdir(DATA_DIR, { recursive: true });
 
   const tempFile = `${DB_FILE}.${process.pid}.tmp`;
   await writeFile(tempFile, JSON.stringify(db, null, 2), "utf8");
   await rename(tempFile, DB_FILE);
+}
+
+export async function readDb(): Promise<Db> {
+  return usePostgres ? readPostgres() : readFileDb();
+}
+
+export async function updateDb<T>(mutator: (db: Db) => T | Promise<T>): Promise<T> {
+  if (usePostgres) return updatePostgres(mutator);
+
+  const db = await readFileDb();
+  const result = await mutator(db);
+  await writeFileDb(db);
+  return result;
 }

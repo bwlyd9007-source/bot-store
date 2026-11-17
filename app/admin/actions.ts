@@ -7,8 +7,8 @@ import {
   hashPassword,
   newId,
   readDb,
+  updateDb,
   verifyPassword,
-  writeDb,
 } from "@/lib/db";
 import { discordResultMessage, sendTestOrderCard } from "@/lib/discord";
 import type { OrderEventType, OrderStatus, StoreOrder } from "@/lib/types";
@@ -98,42 +98,47 @@ export async function saveProductAction(
     };
   }
 
-  const db = await readDb();
-
   if (id) {
-    const index = db.products.findIndex((product) => product.id === id);
-    if (index === -1) {
+    const updated = await updateDb((db) => {
+      const index = db.products.findIndex((product) => product.id === id);
+      if (index === -1) return false;
+
+      db.products[index] = {
+        ...db.products[index],
+        name,
+        tagline,
+        description: description || undefined,
+        category,
+        price,
+        emoji,
+        badge: badge || undefined,
+        features,
+        image,
+      };
+      return true;
+    });
+
+    if (!updated) {
       return { status: "error", message: "هذا المنتج لم يعد موجوداً." };
     }
-    db.products[index] = {
-      ...db.products[index],
-      name,
-      tagline,
-      description: description || undefined,
-      category,
-      price,
-      emoji,
-      badge: badge || undefined,
-      features,
-      image,
-    };
   } else {
-    db.products.unshift({
-      id: newId(),
-      name,
-      tagline,
-      description: description || undefined,
-      category,
-      price,
-      emoji,
-      badge: badge || undefined,
-      features,
-      image,
-      createdAt: new Date().toISOString(),
+    await updateDb((db) => {
+      db.products.unshift({
+        id: newId(),
+        name,
+        tagline,
+        description: description || undefined,
+        category,
+        price,
+        emoji,
+        badge: badge || undefined,
+        features,
+        image,
+        createdAt: new Date().toISOString(),
+      });
     });
   }
 
-  await writeDb(db);
   refreshStore();
   return {
     status: "success",
@@ -145,63 +150,57 @@ export async function saveProductAction(
 export async function deleteProductAction(id: string) {
   await requireAdmin();
 
-  const db = await readDb();
-  const remaining = db.products.filter((product) => product.id !== id);
-  if (remaining.length === db.products.length) return;
-
-  db.products = remaining;
-  await writeDb(db);
+  await updateDb((db) => {
+    db.products = db.products.filter((product) => product.id !== id);
+  });
   refreshStore();
 }
 
 export async function setOrderStatusAction(id: string, status: OrderStatus) {
   await requireAdmin();
 
-  const db = await readDb();
-  const order = db.orders.find((item) => item.id === id);
-  if (!order || order.status === status) return;
+  await updateDb((db) => {
+    const order = db.orders.find((item) => item.id === id);
+    if (!order || order.status === status) return;
 
-  order.status = status;
-  pushEvent(
-    order,
-    "status",
-    status === "done"
-      ? "تم تحويل حالة الطلب إلى «تم»"
-      : "تمت إعادة حالة الطلب إلى «جديد»",
-  );
-  await writeDb(db);
+    order.status = status;
+    pushEvent(
+      order,
+      "status",
+      status === "done"
+        ? "تم تحويل حالة الطلب إلى «تم»"
+        : "تمت إعادة حالة الطلب إلى «جديد»",
+    );
+  });
   refreshStore();
 }
 
 export async function deleteOrderAction(id: string) {
   await requireAdmin();
 
-  const db = await readDb();
-  const remaining = db.orders.filter((order) => order.id !== id);
-  if (remaining.length === db.orders.length) return;
-
-  db.orders = remaining;
-  await writeDb(db);
+  await updateDb((db) => {
+    db.orders = db.orders.filter((order) => order.id !== id);
+  });
   refreshStore();
 }
 
 export async function updateOrderNoteAction(id: string, note: string) {
   await requireAdmin();
 
-  const db = await readDb();
-  const order = db.orders.find((item) => item.id === id);
-  if (!order) return;
-
   const nextNote = note.trim().slice(0, 500) || undefined;
-  if ((order.note ?? undefined) === nextNote) return;
 
-  order.note = nextNote;
-  pushEvent(
-    order,
-    "note",
-    nextNote ? "تم تحديث ملاحظات المتابعة" : "تم حذف ملاحظات المتابعة",
-  );
-  await writeDb(db);
+  await updateDb((db) => {
+    const order = db.orders.find((item) => item.id === id);
+    if (!order) return;
+    if ((order.note ?? undefined) === nextNote) return;
+
+    order.note = nextNote;
+    pushEvent(
+      order,
+      "note",
+      nextNote ? "تم تحديث ملاحظات المتابعة" : "تم حذف ملاحظات المتابعة",
+    );
+  });
   refreshStore();
 }
 
@@ -221,9 +220,9 @@ export async function saveSettingsAction(
     };
   }
 
-  const db = await readDb();
-  db.settings = { whatsappUrl, discordUrl };
-  await writeDb(db);
+  await updateDb((db) => {
+    db.settings = { whatsappUrl, discordUrl };
+  });
   refreshStore();
   return {
     status: "success",
@@ -267,18 +266,24 @@ export async function changePasswordAction(
   const next = field(formData, "next");
   const confirm = field(formData, "confirm");
 
-  const db = await readDb();
-  if (!verifyPassword(current, db.auth.passwordHash)) {
-    return { status: "error", message: "كلمة المرور الحالية غير صحيحة." };
-  }
   if (next.length < 8) {
     return { status: "error", message: "كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل." };
   }
-  if (next !== confirm) {
+
+  const change = await updateDb((db) => {
+    if (!verifyPassword(current, db.auth.passwordHash)) return "wrong-current";
+    if (next !== confirm) return "mismatch";
+
+    db.auth.passwordHash = hashPassword(next);
+    return "ok";
+  });
+
+  if (change === "wrong-current") {
+    return { status: "error", message: "كلمة المرور الحالية غير صحيحة." };
+  }
+  if (change === "mismatch") {
     return { status: "error", message: "تأكيد كلمة المرور غير مطابق." };
   }
 
-  db.auth.passwordHash = hashPassword(next);
-  await writeDb(db);
   return { status: "success", message: "تم تحديث كلمة المرور.", savedAt: Date.now() };
 }

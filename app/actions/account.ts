@@ -5,7 +5,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { getCustomerPhone, endCustomerSession, startCustomerSession } from "@/lib/customer-auth";
 import { formatPhoneDisplay, normalizeSaudiPhone } from "@/lib/customer";
-import { newId, readDb, writeDb } from "@/lib/db";
+import { newId, readDb, updateDb } from "@/lib/db";
 import {
   getWhatsAppStatus,
   isWhatsAppApiConfigured,
@@ -107,17 +107,19 @@ export async function requestOtp(phoneInput: string): Promise<RequestOtpResult> 
   }
 
   const sentAt = new Date(now).toISOString();
-  db.otps = [
-    {
-      phone,
-      codeHash: hashOtp(phone, code),
-      sentAt,
-      expiresAt: new Date(now + OTP_MAX_AGE).toISOString(),
-      attempts: 0,
-    },
-    ...db.otps.filter((entry) => entry.phone !== phone),
-  ];
-  await writeDb(db);
+  const codeHash = hashOtp(phone, code);
+  await updateDb((db) => {
+    db.otps = [
+      {
+        phone,
+        codeHash,
+        sentAt,
+        expiresAt: new Date(now + OTP_MAX_AGE).toISOString(),
+        attempts: 0,
+      },
+      ...db.otps.filter((entry) => entry.phone !== phone),
+    ];
+  });
 
   return {
     ok: true,
@@ -138,47 +140,49 @@ export async function verifyOtp(
     return { ok: false, error: "أدخل رمز التحقق المكوّن من 6 أرقام." };
   }
 
-  const db = await readDb();
-  const entry = db.otps.find((item) => item.phone === phone);
-  if (!entry) {
-    return {
-      ok: false,
-      error: "انتهت صلاحية الرمز أو لم يُطلب بعد. اطلب رمزاً جديداً.",
-    };
-  }
-  if (Date.parse(entry.expiresAt) <= Date.now()) {
+  const outcome = await updateDb<VerifyOtpResult>((db) => {
+    const entry = db.otps.find((item) => item.phone === phone);
+    if (!entry) {
+      return {
+        ok: false,
+        error: "انتهت صلاحية الرمز أو لم يُطلب بعد. اطلب رمزاً جديداً.",
+      };
+    }
+    if (Date.parse(entry.expiresAt) <= Date.now()) {
+      db.otps = db.otps.filter((item) => item.phone !== phone);
+      return { ok: false, error: "انتهت صلاحية الرمز، اطلب رمزاً جديداً." };
+    }
+    if (entry.attempts >= OTP_MAX_ATTEMPTS) {
+      return { ok: false, error: "تجاوزت عدد المحاولات، اطلب رمزاً جديداً." };
+    }
+
+    if (!safeEqual(entry.codeHash, hashOtp(phone, code))) {
+      entry.attempts += 1;
+      const left = OTP_MAX_ATTEMPTS - entry.attempts;
+      return {
+        ok: false,
+        error:
+          left > 0
+            ? `الرمز غير صحيح. متبقي ${left} محاولات.`
+            : "تجاوزت عدد المحاولات، اطلب رمزاً جديداً.",
+      };
+    }
+
     db.otps = db.otps.filter((item) => item.phone !== phone);
-    await writeDb(db);
-    return { ok: false, error: "انتهت صلاحية الرمز، اطلب رمزاً جديداً." };
-  }
-  if (entry.attempts >= OTP_MAX_ATTEMPTS) {
-    return { ok: false, error: "تجاوزت عدد المحاولات، اطلب رمزاً جديداً." };
-  }
 
-  if (!safeEqual(entry.codeHash, hashOtp(phone, code))) {
-    entry.attempts += 1;
-    await writeDb(db);
-    const left = OTP_MAX_ATTEMPTS - entry.attempts;
-    return {
-      ok: false,
-      error:
-        left > 0
-          ? `الرمز غير صحيح. متبقي ${left} محاولات.`
-          : "تجاوزت عدد المحاولات، اطلب رمزاً جديداً.",
-    };
-  }
+    const now = new Date().toISOString();
+    let customer = db.customers.find((item) => item.phone === phone);
+    if (!customer) {
+      customer = { id: newId(), phone, createdAt: now };
+      db.customers.unshift(customer);
+    }
+    customer.lastLoginAt = now;
 
-  db.otps = db.otps.filter((item) => item.phone !== phone);
+    return { ok: true };
+  });
 
-  const now = new Date().toISOString();
-  let customer = db.customers.find((item) => item.phone === phone);
-  if (!customer) {
-    customer = { id: newId(), phone, createdAt: now };
-    db.customers.unshift(customer);
-  }
-  customer.lastLoginAt = now;
+  if (!outcome.ok) return outcome;
 
-  await writeDb(db);
   await startCustomerSession(phone);
   revalidatePath("/account");
 
@@ -216,14 +220,18 @@ export async function saveCustomerNameAction(
     return { status: "error", message: "الاسم طويل جداً، الحد 40 حرفاً." };
   }
 
-  const db = await readDb();
-  const customer = db.customers.find((item) => item.phone === phone);
-  if (!customer) {
+  const saved = await updateDb((db) => {
+    const customer = db.customers.find((item) => item.phone === phone);
+    if (!customer) return false;
+
+    customer.name = name;
+    return true;
+  });
+
+  if (!saved) {
     return { status: "error", message: "تعذّر العثور على بياناتك، سجّل الدخول من جديد." };
   }
 
-  customer.name = name;
-  await writeDb(db);
   revalidatePath("/account");
 
   return { status: "success", message: "تم حفظ اسمك بنجاح." };
