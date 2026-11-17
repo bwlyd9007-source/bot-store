@@ -103,12 +103,7 @@ export function SiteFooter({ settings }: { settings: StoreSettings }) {
 
         <div className="mt-12 flex flex-col items-center justify-between gap-3 border-t border-white/5 pt-6 text-xs text-white/30 sm:flex-row">
           <p>© 2026 BOT STORE — جميع الحقوق محفوظة.</p>
-          <div className="flex items-center gap-4">
-            <p>صُنع لمجتمع ديسكورد العربي</p>
-            <Link href="/admin" className="transition hover:text-accent">
-              لوحة التحكم
-            </Link>
-          </div>
+          <p>صُنع لمجتمع ديسكورد العربي</p>
         </div>
       </div>
     </footer>
